@@ -1,0 +1,6 @@
+{
+  "name": "VidMeet by MMM",
+  "description": "High-quality video meetings without the complexity. Full-stack video collaboration platform with real-time video, screen sharing, chat, scheduling, and developer showcase by Muhammad Muneeb Manzoor.",
+  "requestFramePermissions": ["camera", "microphone", "display-capture"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
