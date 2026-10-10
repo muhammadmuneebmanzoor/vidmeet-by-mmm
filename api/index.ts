@@ -424,7 +424,8 @@ app.get('/api/signaling/events/:roomId', (req, res) => {
       (!m.targetId || m.targetId === participantId) &&
       m.message?.type !== 'webrtc_offer' &&
       m.message?.type !== 'webrtc_answer' &&
-      m.message?.type !== 'webrtc_ice'
+      m.message?.type !== 'webrtc_ice' &&
+      m.message?.type !== 'join'
   );
   for (const item of recent) {
     try {
@@ -458,6 +459,13 @@ app.get('/api/signaling/poll/:roomId', (req, res) => {
       if (m.seq <= sinceSeq) return false;
       if (m.senderId === participantId) return false;
       if (m.targetId && m.targetId !== participantId) return false;
+      if (sinceSeq === 0 && (
+        m.message?.type === 'webrtc_offer' ||
+        m.message?.type === 'webrtc_answer' ||
+        m.message?.type === 'webrtc_ice'
+      )) {
+        return false;
+      }
       return true;
     })
     .map((m) => m.message);
@@ -475,7 +483,8 @@ app.post('/api/signaling/message', (req, res) => {
   const targetId = message.targetId;
   const senderId = message.participantId;
   const seq = storeSignalingMessage(roomId, message);
-  const enrichedMessage = { ...message, __seq: seq };
+  const msgId = message.msgId || `msg_${seq}_${Date.now()}`;
+  const enrichedMessage = { ...message, msgId, __seq: seq };
   const sseData = `data: ${JSON.stringify(enrichedMessage)}\n\n`;
   let deliveredCount = 0;
 

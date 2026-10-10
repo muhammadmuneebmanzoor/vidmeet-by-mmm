@@ -62,7 +62,7 @@ export const VideoTile: React.FC<VideoTileProps> = ({
     const videoEl = videoRef.current;
     if (!videoEl) return;
 
-    // Ensure mobile browsers allow inline playback and autoplay without audio
+    // Ensure mobile browsers allow inline playback. Video element is always muted to comply with autoplay policy.
     (videoEl as any).playsInline = true;
     (videoEl as any).webkitPlaysInline = true;
     videoEl.muted = true;
@@ -151,7 +151,8 @@ export const VideoTile: React.FC<VideoTileProps> = ({
         }}
         autoPlay
         playsInline
-        muted
+        muted={true}
+        data-local={isLocal ? 'true' : undefined}
         onPlay={() => setIsPlaying(true)}
         onPlaying={() => setIsPlaying(true)}
         onPause={() => setIsPlaying(false)}

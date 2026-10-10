@@ -20,6 +20,7 @@ import { MeetingControls } from './MeetingControls';
 import { ParticipantList } from './ParticipantList';
 import { ChatPanel } from './ChatPanel';
 import { useAuth } from '../context/AuthContext';
+import { normalizeRoomId } from '../lib/supabase';
 
 export interface MeetingRoomProps {
   meetingTitle?: string;
@@ -57,6 +58,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   onShowToast,
 }) => {
   const { session } = useAuth();
+  const normalizedMeetingId = normalizeRoomId(meetingId) || meetingId;
 
   // Host state: strictly true ONLY if the server indicates this user is the host
   const [isHost] = useState<boolean>(() => {
@@ -65,9 +67,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
   useEffect(() => {
     try {
-      localStorage.removeItem(`vidmeet_host_${meetingId}`);
+      localStorage.removeItem(`vidmeet_host_${normalizedMeetingId}`);
     } catch {}
-  }, [meetingId]);
+  }, [normalizedMeetingId]);
 
   // Media Controls State
   const [isMicOn, setIsMicOn] = useState(initialMicOn);
@@ -263,31 +265,28 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           localStreamRef.current = stream;
           setLocalStream(stream);
 
-          // If peer connections already exist, attach tracks and ensure renegotiation with host
-          peerConnectionsRef.current.forEach((pc, remoteId) => {
+          // If peer connections already exist, attach tracks directly to existing transceivers/senders
+          peerConnectionsRef.current.forEach((pc) => {
+            const transceivers = pc.getTransceivers();
             const senders = pc.getSenders();
             stream.getTracks().forEach((track) => {
-              const existing = senders.find((s) => s.track?.kind === track.kind);
-              if (existing) {
-                existing.replaceTrack(track).catch(() => {});
+              const transceiver = transceivers.find(
+                (t) => t.receiver.track.kind === track.kind || t.sender.track?.kind === track.kind
+              );
+              if (transceiver && transceiver.sender) {
+                transceiver.sender.replaceTrack(track).catch(() => {});
+                transceiver.direction = 'sendrecv';
               } else {
-                try {
-                  pc.addTrack(track, stream);
-                } catch {}
+                const existing = senders.find((s) => s.track?.kind === track.kind);
+                if (existing) {
+                  existing.replaceTrack(track).catch(() => {});
+                } else {
+                  try {
+                    pc.addTrack(track, stream);
+                  } catch {}
+                }
               }
             });
-
-            if (pc.signalingState === 'stable') {
-              initiateWebRTCPeer(remoteId, true);
-            } else {
-              const onStable = () => {
-                if (pc.signalingState === 'stable') {
-                  pc.removeEventListener('signalingstatechange', onStable);
-                  initiateWebRTCPeer(remoteId, true);
-                }
-              };
-              pc.addEventListener('signalingstatechange', onStable);
-            }
           });
 
           // Inform remote peers of our initial camera/mic states
@@ -1002,10 +1001,13 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
   // Safe helper to broadcast signaling messages across local tabs and remote devices
   const sendSignalingMessage = useCallback((message: any) => {
+    const msgId = message.msgId || `msg_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+    const fullMsg = { ...message, msgId };
+
     // 1. Broadcast locally across same-origin tabs
     if (broadcastChannelRef.current) {
       try {
-        broadcastChannelRef.current.postMessage(message);
+        broadcastChannelRef.current.postMessage(fullMsg);
       } catch {}
     }
 
@@ -1014,21 +1016,21 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        roomId: meetingId,
-        message,
+        roomId: normalizedMeetingId,
+        message: fullMsg,
       }),
     }).catch(() => {});
-  }, [meetingId]);
+  }, [normalizedMeetingId]);
 
   // 3. Multi-Device Real WebRTC Peer Connection (Cross-device SSE + WebRTC Mesh)
   const setupCrossDeviceWebRTC = useCallback(() => {
     if (isWebRTCSetupRef.current) return;
     isWebRTCSetupRef.current = true;
 
-    // 1. Initialize BroadcastChannel if available
+    // 1. Initialize BroadcastChannel if available (canonical room ID matching)
     if (typeof BroadcastChannel !== 'undefined') {
       try {
-        const channelName = `videomeet_realtime_${meetingId}`;
+        const channelName = `videomeet_realtime_${normalizedMeetingId}`;
         const channel = new BroadcastChannel(channelName);
         broadcastChannelRef.current = channel;
         channel.onmessage = (event) => {
@@ -1039,7 +1041,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
     // 2. Initialize Cross-Device SSE Stream with auto-recovery
     try {
-      const sseUrl = `/api/signaling/events/${encodeURIComponent(meetingId)}?participantId=${encodeURIComponent(localParticipantId.current)}`;
+      const sseUrl = `/api/signaling/events/${encodeURIComponent(normalizedMeetingId)}?participantId=${encodeURIComponent(localParticipantId.current)}`;
       const es = new EventSource(sseUrl);
       eventSourceRef.current = es;
 
@@ -1058,6 +1060,9 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         try {
           if (!event.data || event.data.startsWith(':')) return;
           const parsed = JSON.parse(event.data);
+          if (typeof parsed.latestSeq === 'number') {
+            highestSignalingSeqRef.current = Math.max(highestSignalingSeqRef.current, parsed.latestSeq);
+          }
           if (typeof parsed.__seq === 'number') {
             highestSignalingSeqRef.current = Math.max(highestSignalingSeqRef.current, parsed.__seq);
           }
@@ -1075,7 +1080,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     // 3. Resilient background polling to guarantee 100% signaling delivery on mobile networks
     const pollInterval = setInterval(async () => {
       try {
-        const pollUrl = `/api/signaling/poll/${encodeURIComponent(meetingId)}?participantId=${encodeURIComponent(
+        const pollUrl = `/api/signaling/poll/${encodeURIComponent(normalizedMeetingId)}?participantId=${encodeURIComponent(
           localParticipantId.current
         )}&since=${highestSignalingSeqRef.current}`;
         const res = await fetch(pollUrl);
@@ -1096,6 +1101,18 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       } catch {}
     }, 1500);
 
+    // 4. Heartbeat broadcast every 3.5s to ensure reliable presence discovery across late joins & mobile wakeups
+    const heartbeatInterval = setInterval(() => {
+      sendSignalingMessage({
+        type: 'heartbeat',
+        participantId: localParticipantId.current,
+        name: userName || 'User',
+        isHost,
+        isMicOn: isMicOnRef.current,
+        isCamOn: isCamOnRef.current,
+      });
+    }, 3500);
+
     // Announce join to all peers in the room
     sendSignalingMessage({
       type: 'join',
@@ -1108,11 +1125,15 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
 
     return () => {
       clearInterval(pollInterval);
+      clearInterval(heartbeatInterval);
     };
-  }, [meetingId, userName, isHost, sendSignalingMessage]);
+  }, [normalizedMeetingId, userName, isHost, sendSignalingMessage]);
 
   useEffect(() => {
-    setupCrossDeviceWebRTC();
+    const cleanup = setupCrossDeviceWebRTC();
+    return () => {
+      if (typeof cleanup === 'function') cleanup();
+    };
   }, [setupCrossDeviceWebRTC]);
 
   // Helper to drain pending ICE candidates once remoteDescription is set
@@ -1123,7 +1144,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       for (const candidate of list) {
         try {
           if (candidate && (candidate.candidate || candidate.sdpMid !== undefined)) {
-            await pc.addIceCandidate(new RTCIceCandidate(candidate));
+            await pc.addIceCandidate(candidate);
           }
         } catch (e) {
           console.warn('[WebRTC] ICE candidate drain error:', e);
@@ -1158,24 +1179,6 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     });
 
     audioEl.play().catch(() => {});
-
-    // Also route through Web Audio destination for hardware-level playback on mobile & desktop
-    try {
-      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtxClass) {
-        if (!windowAudioContextRef.current) {
-          windowAudioContextRef.current = new AudioCtxClass();
-        }
-        const ctx = windowAudioContextRef.current;
-        if (ctx.state === 'suspended') {
-          ctx.resume().catch(() => {});
-        }
-        const streamSource = ctx.createMediaStreamSource(audioStream);
-        streamSource.connect(ctx.destination);
-      }
-    } catch (e) {
-      console.warn('[Web Audio] Direct output note:', e);
-    }
 
     // Clean up any existing analyzer for this remote peer
     const existing = audioAnalyzersRef.current.get(remoteId);
@@ -1259,66 +1262,6 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     }
   }, []);
 
-  // Helper to reorder video codecs in SDP so VP8 and H264 come first for universal mobile (iOS/Android) compatibility
-  const preferCrossPlatformCodecsInSdp = (sdp: string): string => {
-    try {
-      const lines = sdp.split('\r\n');
-      const mVideoIndex = lines.findIndex((l) => l.startsWith('m=video '));
-      if (mVideoIndex === -1) return sdp;
-
-      const vp8Payloads: string[] = [];
-      const h264Payloads: string[] = [];
-      lines.forEach((l) => {
-        const match = l.match(/^a=rtpmap:(\d+)\s+([A-Za-z0-9]+)\//);
-        if (match) {
-          const pt = match[1];
-          const codec = match[2].toUpperCase();
-          if (codec === 'VP8') vp8Payloads.push(pt);
-          if (codec === 'H264') h264Payloads.push(pt);
-        }
-      });
-
-      const preferred = [...vp8Payloads, ...h264Payloads];
-      if (preferred.length === 0) return sdp;
-
-      const parts = lines[mVideoIndex].split(' ');
-      const header = parts.slice(0, 3);
-      const existingPts = parts.slice(3);
-      const newPts = [
-        ...preferred.filter((pt) => existingPts.includes(pt)),
-        ...existingPts.filter((pt) => !preferred.includes(pt)),
-      ];
-      lines[mVideoIndex] = [...header, ...newPts].join(' ');
-      return lines.join('\r\n');
-    } catch {
-      return sdp;
-    }
-  };
-
-  const preferCrossPlatformTransceiverCodecs = (pc: RTCPeerConnection) => {
-    try {
-      if ('RTCRtpSender' in window && 'getCapabilities' in RTCRtpSender) {
-        const capabilities = RTCRtpSender.getCapabilities('video');
-        if (capabilities && Array.isArray(capabilities.codecs)) {
-          const sorted = [...capabilities.codecs].sort((a, b) => {
-            const aMime = (a.mimeType || '').toLowerCase();
-            const bMime = (b.mimeType || '').toLowerCase();
-            const aScore = aMime.includes('vp8') ? 1 : aMime.includes('h264') ? 2 : 10;
-            const bScore = bMime.includes('vp8') ? 1 : bMime.includes('h264') ? 2 : 10;
-            return aScore - bScore;
-          });
-          pc.getTransceivers().forEach((tr) => {
-            if (tr.sender.track?.kind === 'video' || tr.receiver.track?.kind === 'video') {
-              try {
-                tr.setCodecPreferences(sorted);
-              } catch {}
-            }
-          });
-        }
-      }
-    } catch {}
-  };
-
   const getOrCreatePeerConnection = (remoteId: string) => {
     let pc = peerConnectionsRef.current.get(remoteId);
     if (pc && pc.signalingState === 'closed') {
@@ -1350,20 +1293,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         bundlePolicy: 'max-bundle',
       });
 
-      // Explicitly configure transceivers for both audio and video so mobile can receive streams
-      try {
-        pc.addTransceiver('audio', { direction: 'sendrecv' });
-        pc.addTransceiver('video', { direction: 'sendrecv' });
-      } catch {}
-
       // Add local audio and video tracks to peer connection
       const curStream = localStreamRef.current || localStream;
-      if (curStream) {
+      if (curStream && curStream.getTracks().length > 0) {
         curStream.getTracks().forEach((track) => {
           try {
             pc!.addTrack(track, curStream);
           } catch {}
         });
+      } else {
+        // If local media stream is not ready yet, add transceivers so incoming remote tracks can be received
+        try {
+          pc.addTransceiver('audio', { direction: 'sendrecv' });
+          pc.addTransceiver('video', { direction: 'sendrecv' });
+        } catch {}
       }
 
       // If local screen share is active, also attach screen track
@@ -1522,20 +1465,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
     if (!isInitiator) return;
     try {
       const pc = getOrCreatePeerConnection(remoteId);
-      preferCrossPlatformTransceiverCodecs(pc);
+      if (pc.signalingState !== 'stable') return;
+
       const offer = await pc.createOffer({
         offerToReceiveAudio: true,
         offerToReceiveVideo: true,
       });
-      const modifiedSdp = preferCrossPlatformCodecsInSdp(offer.sdp || '');
-      const finalOffer = { type: offer.type, sdp: modifiedSdp };
-      await pc.setLocalDescription(finalOffer);
+      if (pc.signalingState !== 'stable') return;
+      await pc.setLocalDescription(offer);
 
       sendSignalingMessage({
         type: 'webrtc_offer',
         participantId: localParticipantId.current,
         targetId: remoteId,
-        offer: finalOffer,
+        offer: { type: offer.type, sdp: offer.sdp },
         senderName: userName,
         isHost,
         isMicOn: isMicOnRef.current,
@@ -1549,7 +1492,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
   const handleIncomingSignalingData = async (data: any) => {
     if (!data || data.participantId === localParticipantId.current) return;
 
-    // Deduplicate incoming messages across SSE and Polling streams
+    // Deduplicate incoming messages across BroadcastChannel, SSE, and Polling streams
     const msgKey = data.msgId || (data.__seq ? `seq_${data.__seq}` : null);
     if (msgKey) {
       if (processedMessageIdsRef.current.has(msgKey)) return;
@@ -1599,8 +1542,10 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           isCamOn: isCamOnRef.current,
         });
 
-        // Initiator creates WebRTC offer
-        initiateWebRTCPeer(remoteId, true);
+        // Deterministic initiator: only initiate if localParticipantId.current < remoteId
+        if (localParticipantId.current < remoteId) {
+          initiateWebRTCPeer(remoteId, true);
+        }
         break;
       }
 
@@ -1626,6 +1571,53 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         });
 
         getOrCreatePeerConnection(remoteId);
+        // Deterministic initiator: if local ID is smaller, initiate WebRTC peer
+        if (localParticipantId.current < remoteId) {
+          initiateWebRTCPeer(remoteId, true);
+        }
+        break;
+      }
+
+      case 'heartbeat': {
+        // Continuous discovery: add or update remote peer state
+        setRemoteParticipants((prev) => {
+          if (prev.some((p) => p.id === remoteId)) {
+            return prev.map((p) =>
+              p.id === remoteId
+                ? {
+                    ...p,
+                    name: data.name || p.name,
+                    isHost: typeof data.isHost === 'boolean' ? data.isHost : p.isHost,
+                    isMicOn: typeof data.isMicOn === 'boolean' ? data.isMicOn : p.isMicOn,
+                    isCamOn: typeof data.isCamOn === 'boolean' ? data.isCamOn : p.isCamOn,
+                  }
+                : p
+            );
+          }
+          return [
+            ...prev,
+            {
+              id: remoteId,
+              name: data.name || 'Participant',
+              avatarColor: AVATAR_COLORS[Math.abs(remoteId.charCodeAt(0)) % AVATAR_COLORS.length],
+              isHost: Boolean(data.isHost),
+              isMicOn: typeof data.isMicOn === 'boolean' ? data.isMicOn : true,
+              isCamOn: typeof data.isCamOn === 'boolean' ? data.isCamOn : true,
+              isSpeaking: false,
+              isLocal: false,
+              mediaStream: remoteStreamsRef.current.get(remoteId) || null,
+            },
+          ];
+        });
+
+        // Ensure peer connection exists and is connected
+        const existingPc = peerConnectionsRef.current.get(remoteId);
+        if (!existingPc || existingPc.connectionState === 'failed' || existingPc.connectionState === 'closed') {
+          getOrCreatePeerConnection(remoteId);
+          if (localParticipantId.current < remoteId) {
+            initiateWebRTCPeer(remoteId, true);
+          }
+        }
         break;
       }
 
@@ -1664,17 +1656,30 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
           }
           await pc.setRemoteDescription(new RTCSessionDescription(data.offer));
           await drainPendingIceCandidates(remoteId, pc);
-          preferCrossPlatformTransceiverCodecs(pc);
+
+          // Attach local tracks to transceivers before creating answer
+          const curStream = localStreamRef.current || localStream;
+          if (curStream) {
+            const transceivers = pc.getTransceivers();
+            curStream.getTracks().forEach((track) => {
+              const transceiver = transceivers.find(
+                (t) => t.receiver.track.kind === track.kind || t.sender.track?.kind === track.kind
+              );
+              if (transceiver && transceiver.sender) {
+                transceiver.sender.replaceTrack(track).catch(() => {});
+                transceiver.direction = 'sendrecv';
+              }
+            });
+          }
+
           const answer = await pc.createAnswer();
-          const modifiedSdp = preferCrossPlatformCodecsInSdp(answer.sdp || '');
-          const finalAnswer = { type: answer.type, sdp: modifiedSdp };
-          await pc.setLocalDescription(finalAnswer);
+          await pc.setLocalDescription(answer);
 
           sendSignalingMessage({
             type: 'webrtc_answer',
             participantId: localParticipantId.current,
             targetId: remoteId,
-            answer: finalAnswer,
+            answer: { type: answer.type, sdp: answer.sdp },
             senderName: userName,
             isHost,
             isMicOn: isMicOnRef.current,
@@ -1724,7 +1729,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
         const pc = peerConnectionsRef.current.get(remoteId);
         if (pc && pc.remoteDescription && pc.remoteDescription.type) {
           try {
-            await pc.addIceCandidate(new RTCIceCandidate(data.candidate));
+            await pc.addIceCandidate(data.candidate);
           } catch (e) {
             console.warn('[WebRTC] ICE candidate add error:', e);
           }
@@ -1912,14 +1917,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
             }
 
             peerConnectionsRef.current.forEach((pc) => {
-              const senders = pc.getSenders();
-              const aSender = senders.find((s) => s.track?.kind === 'audio');
-              if (aSender) {
-                aSender.replaceTrack(newTrack).catch(() => {});
+              const transceivers = pc.getTransceivers();
+              const aTransceiver = transceivers.find((t) => t.receiver.track.kind === 'audio' || t.sender.track?.kind === 'audio');
+              if (aTransceiver && aTransceiver.sender) {
+                aTransceiver.sender.replaceTrack(newTrack).catch(() => {});
+                aTransceiver.direction = 'sendrecv';
               } else {
-                try {
-                  pc.addTrack(newTrack, stream || localStreamRef.current!);
-                } catch {}
+                const aSender = pc.getSenders().find((s) => s.track?.kind === 'audio');
+                if (aSender) {
+                  aSender.replaceTrack(newTrack).catch(() => {});
+                } else {
+                  try {
+                    pc.addTrack(newTrack, stream || localStreamRef.current!);
+                  } catch {}
+                }
               }
             });
           }
@@ -1988,14 +1999,20 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
             }
 
             peerConnectionsRef.current.forEach((pc) => {
-              const senders = pc.getSenders();
-              const vSender = senders.find((s) => s.track?.kind === 'video');
-              if (vSender) {
-                vSender.replaceTrack(newTrack).catch(() => {});
+              const transceivers = pc.getTransceivers();
+              const vTransceiver = transceivers.find((t) => t.receiver.track.kind === 'video' || t.sender.track?.kind === 'video');
+              if (vTransceiver && vTransceiver.sender) {
+                vTransceiver.sender.replaceTrack(newTrack).catch(() => {});
+                vTransceiver.direction = 'sendrecv';
               } else {
-                try {
-                  pc.addTrack(newTrack, stream || localStreamRef.current!);
-                } catch {}
+                const vSender = pc.getSenders().find((s) => s.track?.kind === 'video');
+                if (vSender) {
+                  vSender.replaceTrack(newTrack).catch(() => {});
+                } else {
+                  try {
+                    pc.addTrack(newTrack, stream || localStreamRef.current!);
+                  } catch {}
+                }
               }
             });
           }
@@ -2856,7 +2873,7 @@ export const MeetingRoom: React.FC<MeetingRoomProps> = ({
       {/* Container for remote audio elements (kept active in DOM without visual intrusion) */}
       <div
         ref={audioContainerRef}
-        className="fixed w-px h-px opacity-[0.001] pointer-events-none overflow-hidden z-0"
+        className="fixed -top-96 -left-96 w-10 h-10 pointer-events-none z-0"
         aria-hidden="true"
       />
 
